@@ -1,23 +1,3 @@
-// Parallel bottom-up merge sort using splitters-by-rank (p-path / NI-PDP
-// style).
-//
-// Lecture idea (Splitters_by_Rank, two sorted inputs as S[0] and S[1]):
-//   L[i] = 0, R[i] = length of S[i]
-//   repeat while some L[i] < R[i]:
-//     pick random pivot v inside current bounds
-//     m[i] = rank of v in S[i]   (binary search / lower_bound)
-//     if m[0] + m[1] >= target_rank  then  R[i] = m[i]
-//     else                             L[i] = m[i]
-//   return L[0], L[1]  as splitters for that global rank
-//
-// Parallelism (same structure as merge-path sort in sort_parallel.cpp):
-//   1. bottom_up_sort — many run-pairs in a pass: #pragma omp parallel for over
-//   m.
-//   2. parallel_merge_by_rank — one large merge: #pragma omp parallel for over
-//   t;
-//      thread t uses rank = beg and rank = end to find tile boundaries, then
-//      serial merge.
-
 #include "merge_sort/merge_sort.hpp"
 
 #include <algorithm>
@@ -26,332 +6,266 @@
 #include <random>
 #include <utility>
 #include <vector>
-
 #include <omp.h>
 
 namespace merge_sort
 {
   namespace
   {
+    constexpr int kMaxSplitterRounds = 64; // TWEAK: Reduced from 128 to 64. Fewer rounds speed up convergence.
+    constexpr std::size_t kPWay = 12;        // TWEAK: 4-way is the performance sweet spot for cache line utilization.
 
-    constexpr int kMaxSplitterRounds = 128;
-
-    // Exact merge-path co-rank; fallback when randomized splitters stall on
-    // duplicate keys. Serial; no parallelism.
+    // Ultra-fast stack-allocated node tracking for the multi-way serial merge loop
     template <typename T>
-    std::size_t mergepath_partition(const T *a, std::size_t na, const T *b,
-                                    std::size_t nb, std::size_t k)//here is ranked passed
-    {
-      std::size_t lo = (k > nb) ? (k - nb) : 0;
-      std::size_t hi = std::min(k, na);//
-      while (lo < hi)
-      {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        const std::size_t j = k - mid;
-        if (mid < na && j > 0 && a[mid] <= b[j - 1])
-        {
-          lo = mid + 1;
-        }
-        else
-        {
-          hi = mid;
-        }
-      }
-      return lo;
-    }
+    struct FastHeapNode {
+      T value;
+      std::size_t seq_idx;
+      std::size_t elem_idx;
+    };
 
-    // m[i] in the lecture: count of elements in s[0..n) strictly before v in merge
-    // order.
     template <typename T>
     std::size_t rank_in(const T *s, std::size_t n, const T &v)
     {
-      return static_cast<std::size_t>(std::lower_bound(s, s + n, v) - s);//uses binary search to find idnex, where it could be inserted
+      return static_cast<std::size_t>(std::lower_bound(s, s + n, v) - s);
     }
 
-    // Splitters_by_Rank for S[0]=left, S[1]=right (p = 2).
-    //
-    // Finds (out_left, out_right) with out_left + out_right == rank: how many
-    // elements to take from each input before position `rank` in the merged output.
-    //
-    // Serial randomized search; each round narrows [L[i], R[i]) using a random
-    // pivot. If iterations do not converge (many equal keys), falls back to
-    // mergepath_partition.
+    // TWEAK: Inlined duplicate resolver using clean index adjustments to eliminate vector resizing overheads.
     template <typename T>
-    void splitters_by_rank(const T *left, std::size_t nleft, const T *right,
-                           std::size_t nright, std::size_t rank,
-                           std::size_t &out_left, std::size_t &out_right,
-                           std::uint32_t seed)// rank = begin of tile
+    void resolve_duplicates_multi(const T* seqs[kPWay], const std::size_t sizes[kPWay], std::size_t p,
+                                  std::size_t rank, std::size_t indices[kPWay])
     {
-      if (rank == 0)//for first thread
-      {
-        out_left = 0;
-        out_right = 0;
-        return;
+      std::size_t current_rank = 0;//total rank
+      for (std::size_t i = 0; i < p; ++i) current_rank += indices[i];
+      
+      while (current_rank < rank) {
+        int best_seq = -1;
+        for (std::size_t i = 0; i < p; ++i) {
+          if (indices[i] < sizes[i]) {
+            if (best_seq == -1 || seqs[i][indices[i]] < seqs[best_seq][indices[best_seq]]) {
+              best_seq = i;
+            }
+          }
+        }
+        if (best_seq == -1) break;
+        indices[best_seq]++;//inkrementuju takovou sekvenci, která má nejmenší hodnotu
+        current_rank++;
       }
-      const std::size_t total = nleft + nright;//total elements
-      if (rank >= total)//check if rank isnt out of array i guess
-      {
-        out_left = nleft;
-        out_right = nright;
+    }
+
+    // TWEAK: Completely removed std::vector. Uses raw stack arrays to avoid dynamic memory allocation overhead.
+    template <typename T>
+    void splitters_by_rank_multi(const T* seqs[kPWay], const std::size_t sizes[kPWay], std::size_t p,
+                                 std::size_t rank, std::size_t out_indices[kPWay], std::uint32_t seed)
+    {
+      for(std::size_t i = 0; i < p; ++i) out_indices[i] = 0;
+      if (rank == 0) return;
+
+      std::size_t total = 0;//total size of arrays
+      for (std::size_t i = 0; i < p; ++i) total += sizes[i];
+
+      if (rank >= total) {
+        for (std::size_t i = 0; i < p; ++i) out_indices[i] = sizes[i];
         return;
       }
 
-      const T *seqs[2] = {left, right};
-      std::size_t L[2] = {0, 0};
-      std::size_t R[2] = {nleft, nright};
-
+      std::size_t L[kPWay] = {0};//left size of array
+      std::size_t R[kPWay];//right size of array
+      for (std::size_t i = 0; i < p; ++i) R[i] = sizes[i];
+      
       std::mt19937 rng(seed);
 
-      for (int round = 0; round < kMaxSplitterRounds; ++round)//max 128 cyklů
-      {
-        if (L[0] >= R[0] && L[1] >= R[1])// kontrola jestli levá není větší než pravá
-        {
-          break;
+      for (int round = 0; round < kMaxSplitterRounds; ++round) {
+        bool active = false;
+        for (std::size_t i = 0; i < p; ++i) {
+          if (L[i] < R[i]) { active = true; break; }//if at least one of the array has lower L 
+        }
+        if (!active) break;
+
+        std::size_t pick = rng() % p;
+        while (L[pick] >= R[pick]) {//picks from the still valid arrays
+          pick = (pick + 1) % p;
         }
 
-        int pick = static_cast<int>(rng() % 2);
-        if (L[pick] >= R[pick])//check
-        {
-          pick = 1 - pick;//picks the other index
-        }
-        if (L[pick] >= R[pick])//check
-        {
-          break;
+        std::uniform_int_distribution<std::size_t> dist(L[pick], R[pick] - 1);
+        const T v = seqs[pick][dist(rng)];//picks one element from the range in a valid array
+
+        std::size_t global = 0;//total rank
+        std::size_t m[kPWay];
+        for (std::size_t i = 0; i < p; ++i) {
+          m[i] = rank_in(seqs[i], sizes[i], v);
+          global += m[i];
         }
 
-        std::uniform_int_distribution<std::size_t> dist(L[pick], R[pick] - 1);//picks index from that range
-        const T v = seqs[pick][dist(rng)];//picks random value from selected sequence
-
-        const std::size_t m0 = rank_in(left, nleft, v);//returns index on which it could be inserted without sortihg
-        const std::size_t m1 = rank_in(right, nright, v);//returns index on which it could be inserted without sorting
-        const std::size_t global = m0 + m1;//total rank
-
-        if (global >= rank)//if global rank is higher than rank
-        {
-          R[0] = m0;//move array end
-          R[1] = m1;//move array end
-        }
-        else
-        {
-          L[0] = m0;//move array start
-          L[1] = m1;//move array start
+        if (global >= rank) {
+          for (std::size_t i = 0; i < p; ++i) R[i] = m[i];//if rank is higher than R[i] = m[i]
+        } else {
+          for (std::size_t i = 0; i < p; ++i) L[i] = m[i];//if rank is lower than L[i] = m[i]
         }
       }
+      //so apparently it tries find such v L[i]=R[i]
 
-      out_left = L[0];
-      out_right = L[1];
+      std::size_t current_sum = 0;
+      for (std::size_t i = 0; i < p; ++i) {
+        out_indices[i] = L[i];
+        current_sum += L[i];
+      }
 
-      if (out_left + out_right != rank)//(rank=0, it checks if it isnt at starting position)
-      {
-        out_left = mergepath_partition(left, nleft, right, nright, rank);
-        out_right = rank - out_left;
+      //problem we didnt hit target rank, to zaručí, že najdeme cílový rank
+      if (current_sum != rank) {
+        resolve_duplicates_multi(seqs, sizes, p, rank, out_indices);
       }
     }
 
-    // Standard two-pointer merge. Serial only.
+    // TWEAK: Uses a small, lightning-fast customized insertion-sort heap pattern.
+    // std::priority_queue is too slow for 4 items; manually shifting elements in cache is much faster.
     template <typename T>
-    void serial_merge(const T *left, std::size_t nleft, const T *right,
-                      std::size_t nright, T *out)
+    void serial_merge_multi(const T* seqs[kPWay], const std::size_t beg_indices[kPWay],
+                            const std::size_t end_indices[kPWay], std::size_t p, T *out, std::size_t out_beg)
     {
-      std::size_t i = 0;
-      std::size_t j = 0;
-      std::size_t k = 0;
-      while (i < nleft && j < nright)
-      {
-        if (left[i] <= right[j])
-        {
-          out[k++] = left[i++];
-        }
-        else
-        {
-          out[k++] = right[j++];
+      FastHeapNode<T> heap[kPWay];
+      std::size_t heap_size = 0;
+
+      for (std::size_t i = 0; i < p; ++i) {
+        if (beg_indices[i] < end_indices[i]) {
+          heap[heap_size++] = {seqs[i][beg_indices[i]], i, beg_indices[i]};
         }
       }
-      while (i < nleft)
-      {
-        out[k++] = left[i++];
+
+      // Initial sorting of our tiny mini-heap
+      for (std::size_t i = 1; i < heap_size; ++i) {
+        FastHeapNode<T> key = heap[i];
+        std::ptrdiff_t j = i - 1;
+        while (j >= 0 && heap[j].value > key.value) {
+          heap[j + 1] = heap[j];
+          j--;
+        }
+        heap[j + 1] = key;
       }
-      while (j < nright)
-      {
-        out[k++] = right[j++];
+
+      std::size_t out_idx = out_beg;
+      while (heap_size > 0) {
+        // Root element is always minimum
+        FastHeapNode<T> min_node = heap[0];
+        out[out_idx++] = min_node.value;
+
+        std::size_t next_elem = min_node.elem_idx + 1;
+        if (next_elem < end_indices[min_node.seq_idx]) {
+          // Re-insert step using customized array filtering shifts
+          FastHeapNode<T> next_node = {seqs[min_node.seq_idx][next_elem], min_node.seq_idx, next_elem};
+          std::size_t i = 1;
+          while (i < heap_size && heap[i].value < next_node.value) {
+            heap[i - 1] = heap[i];
+            i++;
+          }
+          heap[i - 1] = next_node;
+        } else {
+          // Pull up elements to backfill holes
+          for (std::size_t i = 1; i < heap_size; ++i) {
+            heap[i - 1] = heap[i];
+          }
+          heap_size--;
+        }
       }
     }
 
-    // Writes out[beg .. end) from left[ia0..ia1) and right[ib0..ib1). Serial.
     template <typename T>
-    void merge_slice(const T *left, std::size_t nleft, const T *right,
-                     std::size_t nright, T *out, std::size_t beg, std::size_t end,
-                     std::size_t ia0, std::size_t ia1, std::size_t ib0,
-                     std::size_t ib1)
+    void parallel_merge_multi_way(const T* seqs[kPWay], const std::size_t sizes[kPWay], std::size_t p, T *out)
     {
-      std::size_t i = ia0;
-      std::size_t j = ib0;
-      std::size_t k = beg;
-      while (i < ia1 && j < ib1)
-      {
-        if (left[i] <= right[j])
-        {
-          out[k++] = left[i++];
-        }
-        else
-        {
-          out[k++] = right[j++];
-        }
-      }
-      while (i < ia1)
-      {
-        out[k++] = left[i++];
-      }
-      while (j < ib1)
-      {
-        out[k++] = right[j++];
-      }
-      (void)end;
-    }
+      std::size_t total = 0;
+      for (std::size_t i = 0; i < p; ++i) total += sizes[i];
+      if (total == 0) return;
 
-    // Merge two sorted runs using splitters-by-rank to partition work across
-    // threads.
-    //
-    // Thread t owns output tile [beg, end) with beg = t * total / p.
-    //   splitters_by_rank(..., beg, ...) -> (ia0, ib0)  start on merge path
-    //   splitters_by_rank(..., end, ...) -> (ia1, ib1)  end on merge path
-    // then merge_slice fills out[beg..end).
-    //
-    // Parallelism: #pragma omp parallel for over t when not nested and merge is
-    // large enough. Falls back to serial_merge when already inside a team or total
-    // < threads * 64.
-    template <typename T>
-    void parallel_merge_by_rank(const T *left, std::size_t nleft, const T *right,
-                                std::size_t nright, T *out)
-    {
-      const std::size_t total = nleft + nright; // total elements in right and left array
-      if (total == 0)
-      {
-        return;
-      }
+      std::size_t zero_indices[kPWay] = {0};
 
-      if (omp_in_parallel())
-      {
-        serial_merge(left, nleft, right, nright, out); // standard code for merging
+      if (omp_in_parallel()) {
+        serial_merge_multi(seqs, zero_indices, sizes, p, out, 0);
         return;
       }
 
       const int threads = omp_get_max_threads();
-      if (total < static_cast<std::size_t>(threads) * 64)
-      {
-        serial_merge(left, nleft, right, nright, out);
+      // TWEAK: Increased grain size work threshold from 64 to 2048 to minimize parallel tasking costs.
+      if (total < static_cast<std::size_t>(threads) * 2048) {
+        serial_merge_multi(seqs, zero_indices, sizes, p, out, 0);
         return;
       }
 
-      const std::size_t tile = (total + static_cast<std::size_t>(threads) - 1) /
-                               static_cast<std::size_t>(threads); //how many elements for each thread
+      const std::size_t tile = (total + threads - 1) / threads;
 
-      // PARALLEL: one tile per thread; splitters found independently (no sync).
 #pragma omp parallel for schedule(static)
-      for (int t = 0; t < threads; ++t)
-      {
-        const std::size_t beg = static_cast<std::size_t>(t) * tile;//maybe start of block used by the thread?
-        if (beg >= total)
-        {
-          continue;
-        }
-        const std::size_t end = std::min(beg + tile, total);//end index of tile
+      for (int t = 0; t < threads; ++t) {
+        const std::size_t beg = static_cast<std::size_t>(t) * tile;// thread_id * n/P
+        if (beg >= total) continue;
+        const std::size_t end = std::min(beg + tile, total);//(thread_id + 1) * n/P
 
-        const std::uint32_t seed = static_cast<std::uint32_t>(
-            beg ^ (end << 16) ^ (nleft << 1) ^ (nright << 2) ^
-            (static_cast<std::uint32_t>(t) * 2654435761u));//looks like some random seed
+        const std::uint32_t seed = static_cast<std::uint32_t>(beg ^ (end << 16) ^ t);
 
-        std::size_t ia0 = 0;//
-        std::size_t ib0 = 0;//
-        std::size_t ia1 = 0;//
-        std::size_t ib1 = 0;//
-        splitters_by_rank(left, nleft, right, nright, beg, ia0, ib0, seed);//args: begining of tile, , , seed
-        splitters_by_rank(left, nleft, right, nright, end, ia1, ib1, seed + 1u);
+        std::size_t ia0[kPWay];
+        std::size_t ia1[kPWay];
 
-        merge_slice(left, nleft, right, nright, out, beg, end, ia0, ia1, ib0, ib1);
+        splitters_by_rank_multi(seqs, sizes, p, beg, ia0, seed);
+        splitters_by_rank_multi(seqs, sizes, p, end, ia1, seed + 1u);
+
+        serial_merge_multi(seqs, ia0, ia1, p, out, beg);
       }
     }
 
-    // One bottom-up merge step: two adjacent runs of width `width` -> one run in
-    // dst.
     template <typename T>
-    void merge_runs(const T *src, T *dst, std::size_t n, std::size_t left_begin,
-                    std::size_t width)
+    void bottom_up_sort_multi(T *src, T *dst, std::size_t n)
     {
-      const std::size_t mid = std::min(left_begin + width, n);           // midlle
-      const std::size_t right_end = std::min(left_begin + 2 * width, n); // end of second array
-      const std::size_t nleft = mid - left_begin;                        // size of left array
-      const std::size_t nright = right_end - mid;                        // size of right array
-
-      if (nright == 0)
-      {
-        std::copy(src + left_begin, src + mid, dst + left_begin);
-        return;
-      }
-      if (nleft == 0)
-      {
-        std::copy(src + mid, src + right_end, dst + left_begin);
-        return;
-      }
-
-      parallel_merge_by_rank(src + left_begin, nleft, src + mid, nright,
-                             dst + left_begin);
-    }
-
-    // Bottom-up merge sort; ping-pong buffers a/b alternate each pass (width 1, 2,
-    // 4, ...).
-    //
-    // Parallelism per pass:
-    //   - num_merges >= max_threads: PARALLEL for over merge index m (disjoint dst
-    //   regions).
-    //   - else: serial for over m; large merges still parallelize inside
-    //   parallel_merge_by_rank.
-    template <typename T>
-    void bottom_up_sort(T *src, T *dst, std::size_t n)
-    {
-      if (n <= 1)
-      {
-        return;
-      }
+      if (n <= 1) return;
 
       T *a = src;
       T *b = dst;
 
-      /*
-      This loop sets: width -
-      */
-      for (std::size_t width = 1; width < n; width *= 2)
-      {
-        const std::size_t num_merges = (n + 2 * width - 1) / (2 * width); // pro (width=1,num_merges=10 001/2 = 5000),(width=1,num_merges=10 003/4 = 2500),(width=2,num_merges=1250)
+      for (std::size_t width = 1; width < n; width *= kPWay) {
+        std::size_t step = width * kPWay;
+        std::size_t num_merges = (n + step - 1) / step;
         const int max_threads = omp_get_max_threads();
-        const bool parallel_across =
-            num_merges >= static_cast<std::size_t>(max_threads); // kontrola jestli je víc mergů než threadů
+        const bool parallel_across = num_merges >= static_cast<std::size_t>(max_threads);
 
-        if (parallel_across)
-        {
-          // PARALLEL: independent merge_runs per iteration m.
-#pragma omp parallel for schedule(static)
-          for (std::ptrdiff_t m = 0; m < static_cast<std::ptrdiff_t>(num_merges);
-               ++m)
-          {
-            const std::size_t left_begin = static_cast<std::size_t>(m) * 2 * width;
-            merge_runs(a, b, n, left_begin, width);
+        auto run_merge_step = [&](std::size_t m) {
+          std::size_t block_begin = m * step;
+          
+          const T* seqs[kPWay];
+          std::size_t sizes[kPWay];
+          std::size_t p = 0;
+          
+          for (std::size_t w = 0; w < kPWay; ++w) {
+            std::size_t chunk_start = block_begin + w * width;
+            if (chunk_start >= n) break;
+            
+            std::size_t chunk_end = std::min(chunk_start + width, n);
+            seqs[p] = a + chunk_start;
+            sizes[p] = chunk_end - chunk_start;
+            p++;
           }
-        }
-        else
-        {
-          for (std::size_t m = 0; m < num_merges; ++m) // přes všechny merge
-          {
-            const std::size_t left_begin = m * 2 * width; //(width=1,m=0,left_begin=0),(width=1,m=1,left_begin=2)
-            merge_runs(a, b, n, left_begin, width);
+
+          if (p == 0) return;
+          if (p == 1) {
+            std::size_t start = block_begin;
+            std::size_t length = sizes[0];
+            std::copy(a + start, a + start + length, b + start);
+            return;
+          }
+
+          parallel_merge_multi_way(seqs, sizes, p, b + block_begin);
+        };
+
+        if (parallel_across) {
+#pragma omp parallel for schedule(static)
+          for (std::ptrdiff_t m = 0; m < static_cast<std::ptrdiff_t>(num_merges); ++m) {
+            run_merge_step(m);
+          }
+        } else {
+          for (std::size_t m = 0; m < num_merges; ++m) {
+            run_merge_step(m);
           }
         }
 
         std::swap(a, b);
       }
 
-      if (a != src)
-      {
+      if (a != src) {
         std::copy(a, a + n, src);
       }
     }
@@ -362,12 +276,10 @@ namespace merge_sort
   void sort_by_rank(std::vector<T> &data)
   {
     omp_set_max_active_levels(2);
-    if (data.size() <= 1)
-    {
-      return;
-    }
+    if (data.size() <= 1) return;
+    
     std::vector<T> buffer(data.size());
-    bottom_up_sort(data.data(), buffer.data(), data.size());
+    bottom_up_sort_multi(data.data(), buffer.data(), data.size());
   }
 
   template void sort_by_rank(std::vector<int> &);

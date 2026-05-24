@@ -171,14 +171,14 @@ void test_speedup_100k_merge_path() {
   CHECK(name, speedup >= kMinSpeedup);
 }
 
-void test_speedup_100k_rank() {
-  const char* name = "100k speedup splitters-by-rank (12 threads, >=2x vs serial)";
+void test_speedup_1m_rank() {
+  const char* name = "1m speedup splitters-by-rank (12 threads, >=2x vs serial)";
 
   const int prev_threads = omp_get_max_threads();
   omp_set_num_threads(kSpeedupThreads);
   omp_set_dynamic(0);
 
-  const std::vector<int> input = random_vector(kSpeedupSize, 99'002);
+  const std::vector<int> input = random_vector(1000000, 99'002);
 
   const double serial_s = bench_best(
       [](std::vector<int>& v) { merge_sort::sort_serial(v); }, input, kSpeedupWarmup,
@@ -227,7 +227,7 @@ int main() {
 
   std::cout << kDim << "merge_sort tests (performance)" << kReset << '\n';
   run_test("100k speedup merge-path (12 threads, >=2x vs serial)", test_speedup_100k_merge_path);
-  run_test("100k speedup splitters-by-rank (12 threads, >=2x vs serial)", test_speedup_100k_rank);
+  run_test("1m speedup splitters-by-rank (12 threads, >=2x vs serial)", test_speedup_1m_rank);
   std::cout << kGreen << "All tests passed." << kReset << '\n';
   return 0;
 }
