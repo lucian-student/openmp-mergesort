@@ -30,23 +30,26 @@ namespace merge_sort
     // Binary search on the diagonal i + j = k; no parallelism.
     template <typename T>
     std::size_t mergepath_partition(const T *a, std::size_t na, const T *b, std::size_t nb,
-                                    std::size_t k)
+                                    std::size_t k)// snažím se najít k nejmenších prvků v polích a,b
     {
-      std::size_t lo = (k > nb) ? (k - nb) : 0;
-      std::size_t hi = std::min(k, na);
+      //řekněme, že na=0.5m a nb=0.5m a k=1m/12 = 80k +-
+      std::size_t lo = (k > nb) ? (k - nb) : 0;// k = 1 n/p a k <=nb => lo = 0 
+      std::size_t hi = std::min(k, na);// k <= na => k=80k
       while (lo < hi)
       {
-        const std::size_t mid = lo + (hi - lo) / 2;
-        const std::size_t j = k - mid;
+        const std::size_t mid = lo + (hi - lo) / 2;//prostředek 40k, ted bude 60k
+        const std::size_t j = k - mid;//+- prostředek 40k
         if (mid < na && j > 0 && a[mid] <= b[j - 1])
         {
-          lo = mid + 1;
+          lo = mid + 1;//jestli b je větší než a, tak se zvětší low, řekněme, že to platí lo=40k + 1
         }
         else
         {
-          hi = mid;
+          hi = mid;//jinak se zmenší hi
         }
       }
+      //takže hledam prvek, takový aby se rozdělily dvě pole, tak aby zbylo k prvků
+      //chici, aby b[selected] > a[selected] > b[selected - 1]
       return lo;
     }
 
@@ -121,7 +124,7 @@ namespace merge_sort
 #pragma omp parallel for schedule(static)
       for (int t = 0; t < threads; ++t)
       {
-        const std::size_t beg = static_cast<std::size_t>(t) * tile;
+        const std::size_t beg = static_cast<std::size_t>(t) * tile;//thread_id * n/p
         if (beg >= total)
         {
           continue;
@@ -129,15 +132,17 @@ namespace merge_sort
         const std::size_t end = std::min(beg + tile, total);
 
         // Start/end positions on the merge path for this tile.
-        const std::size_t ia0 = mergepath_partition(left, nleft, right, nright, beg);
-        const std::size_t ia1 = mergepath_partition(left, nleft, right, nright, end);
-        const std::size_t ib0 = beg - ia0;
-        const std::size_t ib1 = end - ia1;
+        //pro n=1m třeba finalní velikost bude 0.5m a 0.5m
+        const std::size_t ia0 = mergepath_partition(left, nleft, right, nright, beg);// pro thread = 0, beg = 0
+        const std::size_t ia1 = mergepath_partition(left, nleft, right, nright, end);// pro thread = 0, end = n/P
+        // [ia0, ia1] tvoří interval vybraných prvů z 0
+        const std::size_t ib0 = beg - ia0;//[ib0,ib1] interval prvků z druhýho pole
+        const std::size_t ib1 = end - ia1;//
 
         // Serial merge of left[ia0..ia1) with right[ib0..ib1) into out[beg..end).
-        std::size_t i = ia0;
-        std::size_t j = ib0;
-        std::size_t k = beg;
+        std::size_t i = ia0;//
+        std::size_t j = ib0;//
+        std::size_t k = beg;//
         while (i < ia1 && j < ib1)
         {
           if (left[i] <= right[j])
