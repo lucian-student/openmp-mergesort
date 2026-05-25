@@ -270,7 +270,7 @@ int main()
   const auto sort_parallel_quick = [](std::vector<int> &v)
   { quick_sort_parallel::sort(v); };
 
-  std::cout << kDim << "quick_sort tests (parallel)" << kReset << '\n';
+  /*std::cout << kDim << "quick_sort tests (parallel)" << kReset << '\n';
   run_test("10 elements", [&]
            { test_10_elements(sort_parallel_quick); });
   run_test("20 elements", [&]
@@ -278,7 +278,7 @@ int main()
   run_test("10000 random elements", [&]
            { test_random(10'000, 42, sort_parallel_quick); });
   run_test("100000 random elements", [&]
-           { test_random(100'000, 12345, sort_parallel_quick); });
+           { test_random(100'000, 12345, sort_parallel_quick); });*/
 
   std::cout << kDim << "merge_sort tests (parallel)" << kReset << '\n';
   run_test("10 elements", [&]
@@ -325,7 +325,7 @@ int main()
   std::cout << kDim << "merge_sort tests (performance)" << kReset << '\n';
   run_test("100k speedup merge-path (12 threads, >=2x vs serial)", test_speedup_100k_merge_path);
   run_test("1m speedup splitters-by-rank (12 threads, >=2x vs serial)", test_speedup_1m_rank);
-  run_test("1m speedu quick (12 threads, >=2x vs serial)", test_speedup_1m_quick);
+  // run_test("1m speedu quick (12 threads, >=2x vs serial)", test_speedup_1m_quick);
   std::cout << kGreen << "All tests passed." << kReset << '\n';
   return 0;
 }

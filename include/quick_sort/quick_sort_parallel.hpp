@@ -64,160 +64,60 @@ namespace quick_sort_parallel
         quick_sequential(data, mid + 1, h);
     }
 
-    // --- High-Performance Parallel Partitioning Loop ---
+    struct Interval
+    {
+        ssize_t start;
+        ssize_t end;
+    };
+
+    /**
+     * Checks if two intervals overlap.
+     * This assumes inclusive boundaries [start, end].
+     */
+    bool do_intervals_overlap(Interval a, Interval b)
+    {
+        // Optional: Ensure the intervals are well-formed (start <= end)
+        // If your data guarantees this, you can omit these two lines.
+        if (a.start > a.end)
+            std::swap(a.start, a.end);
+        if (b.start > b.end)
+            std::swap(b.start, b.end);
+
+        // The core overlap condition
+        return (a.start <= b.end) && (b.start <= a.end);
+    }
+
     template <typename T>
     size_t partition_parallel(T *data, size_t l, size_t h)
     {
-        auto pivot_index = select_pivot(data, l, h);
-        auto pivot = data[pivot_index];
+        /*
+        First question how do i deal with unpaired blocks.
+        * lets say i have 13 blocks and 12 threads.
+        * the problem is that: some of them will pair up and some of them wont.
 
-        // Hide the pivot safely away at the highest boundary index
-        std::swap(data[pivot_index], data[h]);
+        Detection of unpaired:
+        1. if they have some intersection: they paired : left_start, right_start,left_end,righ_end
+        2. if they ovelap more right_start,left_start,right_end,left_end
+             * didnt pair up
+             * how do i handle this unpaired problem? just ignore these blocks
 
-        // Atomic block trackers (Atomic Capture Pointers)
-        size_t next_left_block = l;
-        size_t next_right_block = h; // Exclusive of pivot at index 'h'
+        I will be assigning blocks using atomic capture.
+        * in the end i can have only p dirty blocks
 
-        // Global arrays tracking chunks that were left partially processed ("dirty")
-        // Size bounded by max thread potential allocation footprint
-        constexpr size_t MAX_THREADS = 128;
-        size_t dirty_left_blocks[MAX_THREADS];
-        size_t dirty_right_blocks[MAX_THREADS];
-        int num_dirty_left = 0;
-        int num_dirty_right = 0;
+        Cleanup:
+        At most there will be p dirty blocks.
+        - left  bocks contain  larger elements then pivot
+        - right blocks contain smaller elements then pivot
 
-// Nested parallel level 2 initialization configuration
-#pragma omp parallel num_threads(omp_get_max_threads())
-        {
-            size_t my_l_curr = 0, my_l_end = 0;
-            size_t my_r_curr = 0, my_r_end = 0;
-            bool has_left = false, has_right = false;
+        I can pair these up:
+        In the end there will be only left/right dirty blocks
 
-            while (true)
-            {
-                // Requirement 3: Atomic capture allocation for the Left Pointers
-                // Requirement 3: Atomic capture allocation for the Left Pointers
-                if (!has_left)
-                {
-#pragma omp atomic capture
-                    {
-                        my_l_curr = next_left_block;
-                        next_left_block += BLOCK_SIZE;
-                    }
-                    my_l_end = std::min(my_l_curr + BLOCK_SIZE, h);
-                    if (my_l_curr >= next_right_block)
-                    {
-// Horizons crossed. Refund the block size we over-allocated.
-#pragma omp atomic update
-                        next_left_block -= BLOCK_SIZE;
-                        break;
-                    }
-                    has_left = true;
-                }
+        How do i find the middle? Where i can safely swap elements from dirty blocks?
+        I can just remember last index of right/left block. If all right blocks are clean(middle will be determined by right blocks(for left viceversa).
 
-                // Requirement 3: Atomic capture allocation for the Right Pointers
-                if (!has_right)
-                {
-#pragma omp atomic capture
-                    {
-                        my_r_end = next_right_block;
-                        next_right_block = (next_right_block > BLOCK_SIZE) ? (next_right_block - BLOCK_SIZE) : l;
-                    }
-                    my_r_curr = (my_r_end > BLOCK_SIZE) ? std::max(my_r_end - BLOCK_SIZE, l) : l;
-                    if (my_r_end <= next_left_block || my_r_curr >= my_r_end)
-                    {
-                        // Horizons crossed. Refund the precise amount we over-allocated from the right.
-                        if (my_r_end > my_r_curr)
-                        {
-                            size_t allocated_size = my_r_end - my_r_curr;
-#pragma omp atomic update
-                            next_right_block += allocated_size;
-                        }
-                        break;
-                    }
-                    has_right = true;
-                }
-
-                // Requirement 4: Thread possesses two functional blocks. Cross-swap misaligned data items.
-                while (my_l_curr < my_l_end && my_r_curr < my_r_end)
-                {
-                    while (my_l_curr < my_l_end && data[my_l_curr] < pivot)
-                        my_l_curr++;
-                    while (my_r_curr < my_r_end && data[my_r_end - 1] >= pivot)
-                        my_r_end--;
-
-                    if (my_l_curr < my_l_end && my_r_curr < my_r_end)
-                    {
-                        std::swap(data[my_l_curr], data[my_r_end - 1]);
-                        my_l_curr++;
-                        my_r_end--;
-                    }
-                }
-
-                if (my_l_curr >= my_l_end)
-                    has_left = false;
-                if (my_r_curr >= my_r_end)
-                    has_right = false;
-            }
-
-            // Requirement 4 & 5: Save unaligned "dirty" block remnants that ran out of cross-partners
-            if (has_left && my_l_curr < my_l_end)
-            {
-                int idx;
-#pragma omp atomic capture
-                idx = num_dirty_left++;
-                dirty_left_blocks[idx] = my_l_curr; // Mark start position of unprocessed elements
-            }
-            if (has_right && my_r_curr < my_r_end)
-            {
-                int idx;
-#pragma omp atomic capture
-                idx = num_dirty_right++;
-                dirty_right_blocks[idx] = my_r_end; // Mark end position of unprocessed elements
-            }
-        } // Implicit synchronization barrier happens right here
-
-        // Requirement 6: Sequential Cleanup phase for lingering dirty intersections
-        size_t final_left_ptr = (next_left_block < h) ? next_left_block : l;
-        size_t final_right_ptr = next_right_block;
-
-        // Process residual isolated unaligned pieces from the dynamic tracking buffers
-        for (int x = 0; x < num_dirty_left; ++x)
-        {
-            size_t curr = dirty_left_blocks[x];
-            while (curr < final_right_ptr)
-            {
-                if (data[curr] >= pivot)
-                {
-                    while (final_right_ptr > curr && data[final_right_ptr - 1] >= pivot)
-                    {
-                        final_right_ptr--;
-                    }
-                    if (final_right_ptr > curr)
-                    {
-                        std::swap(data[curr], data[final_right_ptr - 1]);
-                        final_right_ptr--;
-                    }
-                }
-                curr++;
-            }
-        }
-
-        // Handle structural center convergence using fallback partitioning mechanics
-        size_t i = l;
-        for (size_t j = l; j < h; ++j)
-        {
-            if (data[j] < pivot)
-            {
-                if (i != j)
-                    std::swap(data[i], data[j]);
-                i++;
-            }
-        }
-
-        // Restore the hidden central pivot back to its final structural split destination
-        std::swap(data[i], data[h]);
-        return i;
+        In that point i will just swap out all dirty values.
+        */
+        return l;
     }
 
     template <typename T>
