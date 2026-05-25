@@ -5,11 +5,12 @@
 #include <cstddef>
 #include <utility>
 #include <vector>
+#include <random>
 #include <functional>
 #include <utility>
 #include <iostream>
 
-namespace quick_sort
+namespace quick_sort_single
 {
     template <typename T>
     size_t select_pivot(T *data, size_t l, size_t h)
@@ -35,35 +36,20 @@ namespace quick_sort
         auto pivot_index = select_pivot(data, l, h);
         auto pivot = data[pivot_index];
         std::swap(data[pivot_index], data[h]);
-        ssize_t i = static_cast<ssize_t>(l);
-        ssize_t j = static_cast<ssize_t>(h - 1);
-        while (i < j)
+        size_t i = l;
+        for (size_t j = l; j < h; ++j)
         {
-            if (data[i] > pivot)
+            if (data[j] < pivot)
             {
-                std::swap(data[i], data[j]);
-                j--;
-            }
-            else if (data[j] < pivot)
-            {
-                std::swap(data[i], data[j]);
+                if (i != j)
+                { // Avoid self-swapping
+                    std::swap(data[i], data[j]);
+                }
                 i++;
             }
-            else
-            {
-                i++;
-                j--;
-            }
         }
-        auto new_pivot_index = (i > h) ? h : i;
-        if (data[new_pivot_index] < pivot)
-        {
-            new_pivot_index = new_pivot_index + 1;
-            std::swap(data[new_pivot_index], data[h]);
-        }
-        else if (data[new_pivot_index] > pivot)
-            std::swap(data[new_pivot_index], data[h]);
-        return new_pivot_index;
+        std::swap(data[i], data[h]);
+        return i;
     }
 
     template <typename T>
