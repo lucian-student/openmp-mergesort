@@ -1,4 +1,5 @@
 #include <merge_sort/merge_sort.hpp>
+#include <quick_sort/quick_sort_serial.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -203,6 +204,7 @@ void test_speedup_1m_rank() {
 int main() {
   const auto sort_parallel = [](std::vector<int>& v) { merge_sort::sort(v); };
   const auto sort_serial = [](std::vector<int>& v) { merge_sort::sort_serial(v); };
+  const auto sort_srial_quick = [](std::vector<int>& v){ quick_sort::sort_serial(v); };
 
   std::cout << kDim << "merge_sort tests (parallel)" << kReset << '\n';
   run_test("10 elements", [&] { test_10_elements(sort_parallel); });
@@ -224,6 +226,12 @@ int main() {
   run_test("serial: 10 elements", [&] { test_10_elements(sort_serial); });
   run_test("serial: 20 elements", [&] { test_20_elements(sort_serial); });
   run_test("serial: 1000 random elements", [&] { test_random(1'000, 77, sort_serial); });
+
+
+  std::cout << kDim << "quick_sort tests (serial)" << kReset << '\n';
+  run_test("serial: 10 elements", [&] { test_10_elements(sort_srial_quick); });
+  run_test("serial: 20 elements", [&] { test_20_elements(sort_srial_quick); });
+  run_test("serial: 1000 random elements", [&] { test_random(1'000, 77, sort_srial_quick); });
 
   std::cout << kDim << "merge_sort tests (performance)" << kReset << '\n';
   run_test("100k speedup merge-path (12 threads, >=2x vs serial)", test_speedup_100k_merge_path);
